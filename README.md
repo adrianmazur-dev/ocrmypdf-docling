@@ -20,6 +20,13 @@ Wait for `http://127.0.0.1:5001/health` to respond. For CUDA, use a [DCC CUDA im
 
 ## Use the plugin
 
+Install OCRmyPDF and the plugin in the same tool environment.
+
+```sh
+uv tool install --python 3.14 --with ocrmypdf-docling ocrmypdf
+ocrmypdf --docling -l pol --sidecar output.txt input.pdf output.pdf
+```
+
 From this repository, install with `uv sync --locked` and run OCRmyPDF with `uv run`.
 
 ```sh
