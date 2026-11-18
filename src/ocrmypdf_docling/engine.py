@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from os import environ
 from pathlib import Path
 from typing import Literal, cast
@@ -51,7 +52,20 @@ class _SegmentedPage(BaseModel):
     word_cells: list[_Cell]
 
 
-def _pixel_box(rect: _Rectangle, frame: BoundingBox, page: BoundingBox) -> BoundingBox:
+class _LayoutBox(BaseModel):
+    l: FiniteFloat
+    t: FiniteFloat
+    r: FiniteFloat
+    b: FiniteFloat
+    coord_origin: _Origin
+
+    def bounds(self) -> BoundingBox:
+        return BoundingBox(self.l, min(self.t, self.b), self.r, max(self.t, self.b))
+
+
+def _pixel_box(
+    rect: _Rectangle | _LayoutBox, frame: BoundingBox, page: BoundingBox
+) -> BoundingBox:
     box = rect.bounds()
     if rect.coord_origin == "BOTTOMLEFT":
         top, bottom = frame.bottom - box.bottom, frame.bottom - box.top
@@ -75,7 +89,40 @@ def _overlap(first: BoundingBox, second: BoundingBox) -> float:
     return max(0.0, width) * max(0.0, height)
 
 
-def _map_page(segmented: _SegmentedPage, page: OcrElement) -> str:
+def _body_regions(document: dict, item: dict) -> Iterator[_LayoutBox]:
+    """Walk the references in the document's body in reading order."""
+    for provenance in item.get("prov", []):
+        if provenance.get("page_no") == 1:
+            yield _LayoutBox.model_validate(provenance["bbox"])
+    for child in item.get("children", []):
+        collection, _, index = child["$ref"].removeprefix("#/").partition("/")
+        yield from _body_regions(document, document[collection][int(index)])
+
+
+def _order_lines(
+    lines: list[OcrElement],
+    regions: list[BoundingBox],
+) -> list[OcrElement]:
+    # Keep the positions of lines outside the document body, such as headers.
+    matched = []
+    for index, line in enumerate(lines):
+        assert line.bbox is not None
+        overlaps = [_overlap(line.bbox, region) for region in regions]
+        region = max(range(len(regions)), key=overlaps.__getitem__)
+        if overlaps[region] > line.bbox.width * line.bbox.height / 2:
+            matched.append((index, region, line))
+
+    ordered = lines.copy()
+    for original, sorted_item in zip(
+        matched, sorted(matched, key=lambda item: item[1]), strict=True
+    ):
+        ordered[original[0]] = sorted_item[2]
+    return ordered
+
+
+def _map_page(
+    segmented: _SegmentedPage, layout: list[_LayoutBox], page: OcrElement
+) -> str:
     assert page.bbox is not None
     frame = segmented.dimension.rect.bounds()
     if frame.width <= 0 or frame.height <= 0:
@@ -109,12 +156,15 @@ def _map_page(segmented: _SegmentedPage, page: OcrElement) -> str:
 
     if any(not line.children for line in page.children):
         raise ValueError("the server returned a text line without word boxes")
+    if layout and len(page.children) > 1:
+        regions = [_pixel_box(region, frame, page.bbox) for region in layout]
+        page.children = _order_lines(page.children, regions)
     return "".join(f"{line.get_text_recursive()}\n" for line in page.children)
 
 
 def _fetch_page(
     input_file: Path, settings: DoclingOptions, languages: list[str]
-) -> _SegmentedPage:
+) -> tuple[_SegmentedPage, list[_LayoutBox]]:
     data = {
         "from_formats": "image",
         "to_formats": "json",
@@ -147,7 +197,20 @@ def _fetch_page(
         raise ValueError(
             "response lacks word_boxes for the uploaded image; enable the DCC extension"
         )
-    return _SegmentedPage.model_validate(pages["1"])
+    assert isinstance(document, dict)
+    json_content = document.get("json_content") or {}
+    try:
+        layout = list(_body_regions(json_content, json_content.get("body", {})))
+    except (
+        AttributeError,
+        IndexError,
+        KeyError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise ValueError("invalid DoclingDocument layout") from error
+    return _SegmentedPage.model_validate(pages["1"]), layout
 
 
 class DoclingEngine(OcrEngine):
@@ -189,7 +252,7 @@ class DoclingEngine(OcrEngine):
 
         prefix = f"Docling Serve OCR failed on page {page_number + 1}"
         try:
-            segmented = _fetch_page(input_file, settings, languages)
+            segmented, layout = _fetch_page(input_file, settings, languages)
             with Image.open(input_file) as image:
                 dpi = image.info.get("dpi", (300, 300))
                 page = OcrElement(
@@ -199,7 +262,7 @@ class DoclingEngine(OcrEngine):
                     page_number=page_number,
                     language=options.languages[0] if options.languages else None,
                 )
-                text = _map_page(segmented, page)
+                text = _map_page(segmented, layout, page)
             return page, text
         except httpx.TimeoutException as error:
             raise SubprocessOutputError(
