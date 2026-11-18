@@ -19,6 +19,9 @@ dependencies = [
     "pydantic>=2.14",
 ]
 
+[project.entry-points.ocrmypdf]
+docling = "ocrmypdf_docling.plugin"
+
 [dependency-groups]
 dev = [
     "ruff>=0.17.5",
