@@ -184,6 +184,8 @@ def _order_table(
 
 def _fit_line_to_ink(image: Image.Image, line: OcrElement) -> None:
     """Estimate horizontal text metrics from the pixels inside a DCC line."""
+    if line.textangle is not None:
+        return
     box = line.bbox
     assert box is not None
     words = [word.bbox for word in line.children if word.bbox is not None]
@@ -229,6 +231,23 @@ def _fit_line_to_ink(image: Image.Image, line: OcrElement) -> None:
     line.baseline = Baseline(intercept=baseline - ink_bottom)
 
 
+def _line_indices(lines: list[_Cell], words: list[_Cell]) -> list[int] | None:
+    """Match the OCR word stream to lines before using their approximate boxes."""
+    indices: list[int] = []
+    for index, line in enumerate(lines):
+        text = "".join(line.text.split())
+        offset = 0
+        while offset < len(text) and len(indices) < len(words):
+            token = "".join(words[len(indices)].text.split())
+            if not text.startswith(token, offset):
+                return None
+            indices.append(index)
+            offset += len(token)
+        if offset != len(text):
+            return None
+    return indices if len(indices) == len(words) else None
+
+
 def _map_page(
     segmented: _SegmentedPage, layout: list[_LayoutRegion], page: OcrElement
 ) -> str:
@@ -252,22 +271,37 @@ def _map_page(
 
     line_boxes = [_pixel_box(line.rect, frame, page.bbox) for line in lines]
     page.children = [OcrElement(OcrClass.LINE, bbox) for bbox in line_boxes]
-    for word in words:
+    line_indices = _line_indices(lines, words)
+    for index, word in enumerate(words):
         box = _pixel_box(word.rect, frame, page.bbox)
-        best_line = max(
-            range(len(line_boxes)), key=lambda index: _overlap(line_boxes[index], box)
-        )
-        if _overlap(line_boxes[best_line], box) == 0:
-            raise ValueError("a word box does not overlap any text line")
-        page.children[best_line].children.append(
+        if line_indices is None:
+            line_index = max(
+                range(len(line_boxes)), key=lambda i: _overlap(line_boxes[i], box)
+            )
+            if _overlap(line_boxes[line_index], box) == 0:
+                raise ValueError("a word box does not overlap any text line")
+        else:
+            line_index = line_indices[index]
+        page.children[line_index].children.append(
             OcrElement(OcrClass.WORD, box, text=word.text, confidence=word.confidence)
         )
 
-    if any(not line.children for line in page.children):
-        raise ValueError("the server returned a text line without word boxes")
+    for line, box in zip(page.children, line_boxes, strict=True):
+        if not line.children:
+            raise ValueError("the server returned a text line without word boxes")
+        if box.height >= 1.5 * box.width:
+            first, last = line.children[0].bbox, line.children[-1].bbox
+            assert first is not None and last is not None
+            # RapidOCR reads tall crops downward by default. Use the word
+            # positions to detect a line whose reading direction goes up.
+            line.textangle = (
+                90.0 if last.top + last.bottom < first.top + first.bottom else 270.0
+            )
+
     if layout and len(page.children) > 1:
         regions = [_pixel_box(region.bbox, frame, page.bbox) for region in layout]
         page.children = _order_lines(page.children, regions)
+    if page.children:
         for region in layout:
             cells = {
                 (cell.start_row_offset_idx, cell.start_col_offset_idx): _pixel_box(

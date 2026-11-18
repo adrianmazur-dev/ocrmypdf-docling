@@ -30,6 +30,8 @@ def _element(element: OcrElement) -> str:
         title += f"; x_wconf {round(element.confidence * 100)}"
     if element.baseline is not None:
         title += f"; baseline {element.baseline.slope:.4f} {round(element.baseline.intercept)}"
+    if element.textangle is not None:
+        title += f"; textangle {element.textangle:g}"
     content = (
         " ".join(map(_element, element.children))
         if element.children
