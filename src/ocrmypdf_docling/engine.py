@@ -1,12 +1,15 @@
+from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from itertools import accumulate
+from math import ceil, floor
 from os import environ
 from pathlib import Path
 from typing import Literal, cast
 
 import httpx
-from ocrmypdf import BoundingBox, OcrClass, OcrElement, OcrOptions
+from ocrmypdf import Baseline, BoundingBox, OcrClass, OcrElement, OcrOptions
 from ocrmypdf.exceptions import BadArgsError, SubprocessOutputError
 from ocrmypdf.pluginspec import OcrEngine, OrientationConfidence
 from PIL import Image
@@ -179,6 +182,53 @@ def _order_table(
     return remaining
 
 
+def _fit_line_to_ink(image: Image.Image, line: OcrElement) -> None:
+    """Estimate horizontal text metrics from the pixels inside a DCC line."""
+    box = line.bbox
+    assert box is not None
+    words = [word.bbox for word in line.children if word.bbox is not None]
+    if not words:
+        return
+    # Table cells can share the original line box. Measure the fragment's words.
+    left = floor(min(word.left for word in words))
+    right = ceil(max(word.right for word in words))
+    top, bottom = floor(box.top), ceil(box.bottom)
+    if bottom - top < 4 or right - left < bottom - top:
+        return
+
+    with image.crop((left, top, right, bottom)) as patch:
+        count = patch.width * patch.height
+        histogram = list(accumulate(patch.histogram()))
+        dark = bisect_left(histogram, ceil(count * 0.05))
+        light = bisect_left(histogram, ceil(count * 0.95))
+        if light - dark < 40:
+            return
+        threshold = (dark + light) // 2
+        with patch.point(
+            [255 if value < threshold else 0 for value in range(256)]
+        ) as mask:
+            # The BOX filter averages each row into one ink coverage value.
+            profile = mask.resize((1, patch.height), Image.Resampling.BOX).tobytes()
+
+    peak = max(profile)
+    if peak == 0 or peak > 0.9 * 255:
+        return  # Empty line, ruled line, or dark background.
+    dense = [row for row, coverage in enumerate(profile) if coverage >= 0.3 * peak]
+    first, last = dense[0], dense[-1]
+    while first > 0 and profile[first - 1] > 0.02 * peak:
+        first -= 1
+    while last + 1 < len(profile) and profile[last + 1] > 0.02 * peak:
+        last += 1
+    ink_top = max(box.top, float(top + first))
+    ink_bottom = min(box.bottom, float(top + last + 1))
+    if ink_bottom - ink_top < box.height / 4:
+        return  # A speck or an incomplete line gives an unreliable measurement.
+
+    baseline = min(ink_bottom, float(top + dense[-1] + 1))
+    line.bbox = BoundingBox(box.left, ink_top, box.right, ink_bottom)
+    line.baseline = Baseline(intercept=baseline - ink_bottom)
+
+
 def _map_page(
     segmented: _SegmentedPage, layout: list[_LayoutRegion], page: OcrElement
 ) -> str:
@@ -334,6 +384,10 @@ class DoclingEngine(OcrEngine):
                     language=options.languages[0] if options.languages else None,
                 )
                 text = _map_page(segmented, layout, page)
+                if page.children:
+                    with image.convert("L") as grayscale:
+                        for line in page.children:
+                            _fit_line_to_ink(grayscale, line)
             return page, text
         except httpx.TimeoutException as error:
             raise SubprocessOutputError(

@@ -28,6 +28,8 @@ def _element(element: OcrElement) -> str:
             title += f"; scan_res {dpi} {dpi}"
     if element.confidence is not None:
         title += f"; x_wconf {round(element.confidence * 100)}"
+    if element.baseline is not None:
+        title += f"; baseline {element.baseline.slope:.4f} {round(element.baseline.intercept)}"
     content = (
         " ".join(map(_element, element.children))
         if element.children
