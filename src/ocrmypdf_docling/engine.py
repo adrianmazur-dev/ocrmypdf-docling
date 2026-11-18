@@ -1,4 +1,6 @@
+from collections import defaultdict
 from collections.abc import Iterator
+from dataclasses import dataclass, replace
 from os import environ
 from pathlib import Path
 from typing import Literal, cast
@@ -63,6 +65,18 @@ class _LayoutBox(BaseModel):
         return BoundingBox(self.l, min(self.t, self.b), self.r, max(self.t, self.b))
 
 
+class _TableCell(BaseModel):
+    start_row_offset_idx: int
+    start_col_offset_idx: int
+    bbox: _LayoutBox | None = None
+
+
+@dataclass
+class _LayoutRegion:
+    bbox: _LayoutBox
+    cells: list[_TableCell]
+
+
 def _pixel_box(
     rect: _Rectangle | _LayoutBox, frame: BoundingBox, page: BoundingBox
 ) -> BoundingBox:
@@ -89,11 +103,19 @@ def _overlap(first: BoundingBox, second: BoundingBox) -> float:
     return max(0.0, width) * max(0.0, height)
 
 
-def _body_regions(document: dict, item: dict) -> Iterator[_LayoutBox]:
+def _body_regions(document: dict, item: dict) -> Iterator[_LayoutRegion]:
     """Walk the references in the document's body in reading order."""
     for provenance in item.get("prov", []):
         if provenance.get("page_no") == 1:
-            yield _LayoutBox.model_validate(provenance["bbox"])
+            cells = (
+                item.get("data", {}).get("table_cells", [])
+                if item.get("label") == "table"
+                else []
+            )
+            yield _LayoutRegion(
+                _LayoutBox.model_validate(provenance["bbox"]),
+                [_TableCell.model_validate(cell) for cell in cells],
+            )
     for child in item.get("children", []):
         collection, _, index = child["$ref"].removeprefix("#/").partition("/")
         yield from _body_regions(document, document[collection][int(index)])
@@ -120,8 +142,45 @@ def _order_lines(
     return ordered
 
 
+def _order_table(
+    lines: list[OcrElement], cells: dict[tuple[int, int], BoundingBox]
+) -> list[OcrElement]:
+    remaining: list[OcrElement] = []
+    table: dict[tuple[int, int], list[OcrElement]] = defaultdict(list)
+    table_start = None
+    for line in lines:
+        parts: dict[tuple[int, int], list[OcrElement]] = defaultdict(list)
+        outside: list[OcrElement] = []
+        for word in line.children:
+            assert word.bbox is not None
+            word_box = word.bbox
+            position = max(cells, key=lambda key: _overlap(word_box, cells[key]))
+            if (
+                _overlap(word_box, cells[position])
+                > word_box.width * word_box.height / 2
+            ):
+                parts[position].append(word)
+            else:
+                outside.append(word)
+        if not parts:
+            remaining.append(line)
+            continue
+        if table_start is None:
+            table_start = len(remaining)
+        if outside:
+            remaining.append(replace(line, children=outside))
+        for position, words in parts.items():
+            table[position].append(replace(line, children=words))
+
+    if table_start is not None:
+        remaining[table_start:table_start] = [
+            line for position in sorted(table) for line in table[position]
+        ]
+    return remaining
+
+
 def _map_page(
-    segmented: _SegmentedPage, layout: list[_LayoutBox], page: OcrElement
+    segmented: _SegmentedPage, layout: list[_LayoutRegion], page: OcrElement
 ) -> str:
     assert page.bbox is not None
     frame = segmented.dimension.rect.bounds()
@@ -157,21 +216,33 @@ def _map_page(
     if any(not line.children for line in page.children):
         raise ValueError("the server returned a text line without word boxes")
     if layout and len(page.children) > 1:
-        regions = [_pixel_box(region, frame, page.bbox) for region in layout]
+        regions = [_pixel_box(region.bbox, frame, page.bbox) for region in layout]
         page.children = _order_lines(page.children, regions)
+        for region in layout:
+            cells = {
+                (cell.start_row_offset_idx, cell.start_col_offset_idx): _pixel_box(
+                    cell.bbox, frame, page.bbox
+                )
+                for cell in region.cells
+                if cell.bbox is not None
+                and cell.bbox.l < cell.bbox.r
+                and cell.bbox.t != cell.bbox.b
+            }
+            if cells:
+                page.children = _order_table(page.children, cells)
     return "".join(f"{line.get_text_recursive()}\n" for line in page.children)
 
 
 def _fetch_page(
     input_file: Path, settings: DoclingOptions, languages: list[str]
-) -> tuple[_SegmentedPage, list[_LayoutBox]]:
+) -> tuple[_SegmentedPage, list[_LayoutRegion]]:
     data = {
         "from_formats": "image",
         "to_formats": "json",
         "include_word_boxes": "true",
         "do_ocr": "true",
         "force_ocr": "true",
-        "do_table_structure": "false",
+        "do_table_structure": "true",
         "ocr_preset": settings.preset,
         "ocr_lang": languages,
     }
